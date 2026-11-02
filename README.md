@@ -54,7 +54,8 @@ PostgreSQL (or in-memory) stores thread state so HITL pause/resume works.
 ### 1. Create virtual environment
 
 ```powershell
-cd "D:\cv project"
+git clone https://github.com/umarhassan-cloud/tripmate-ai-multi-agent.git
+cd tripmate-ai-multi-agent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```

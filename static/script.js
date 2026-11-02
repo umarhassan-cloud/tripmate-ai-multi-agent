@@ -1,17 +1,31 @@
 let currentThreadId = localStorage.getItem("travel_thread_id") || null;
 let latestAnswerMarkdown = "";
 let waitingForApproval = false;
+let latestData = null;
 
 const AGENT_LABELS = {
-  flight_agent: "✈️ Flight Agent",
-  hotel_agent: "🏨 Hotel Agent",
-  weather_agent: "🌦️ Weather Agent",
-  budget_agent: "💰 Budget Agent",
-  itinerary_agent: "🗓️ Itinerary Agent"
+  flight_agent: "Flight Agent",
+  hotel_agent: "Hotel Agent",
+  weather_agent: "Weather Agent",
+  budget_agent: "Budget Agent",
+  itinerary_agent: "Itinerary Agent"
 };
 
+const SPECIALISTS = Object.keys(AGENT_LABELS);
+
+// Result tabs: the plan itself plus each specialist's raw output (when present).
+const RESULT_TABS = [
+  { key: "plan", label: "Travel plan" },
+  { key: "flight_results", label: "Flights" },
+  { key: "hotel_results", label: "Hotels" },
+  { key: "weather_results", label: "Weather" },
+  { key: "budget_results", label: "Budget" }
+];
+
 function setPrompt(text) {
-  document.getElementById("userInput").value = text;
+  const input = document.getElementById("userInput");
+  input.value = text;
+  input.focus();
 }
 
 function setLoading(isLoading, mode = "draft") {
@@ -49,27 +63,106 @@ function hideError() {
 
 function renderMarkdown(element, markdown) {
   if (typeof marked !== "undefined") {
-    element.innerHTML = marked.parse(markdown || "");
+    const html = marked.parse(markdown || "");
+    // LLM output is untrusted, so sanitize before injecting it into the page.
+    element.innerHTML = typeof DOMPurify !== "undefined" ? DOMPurify.sanitize(html) : html;
   } else {
     element.innerText = markdown || "";
   }
 }
 
-function showWorkflow(data) {
+// ---------- Pipeline graph ----------
+
+function setNodeState(name, state) {
+  const node = document.querySelector(`.node[data-node="${name}"]`);
+  if (!node) {
+    return;
+  }
+  node.classList.remove("active", "done", "waiting", "blocked", "skipped");
+  if (state) {
+    node.classList.add(state);
+  }
+}
+
+function setPipelineStatus(text, state) {
+  const status = document.getElementById("pipelineStatus");
+  status.textContent = text;
+  status.className = `pipeline-status ${state || ""}`;
+}
+
+function pipelineRunning(stage) {
+  if (stage === "draft") {
+    ["guardrail", "supervisor", ...SPECIALISTS].forEach((n) => setNodeState(n, "active"));
+    ["human_approval", "final_agent"].forEach((n) => setNodeState(n, null));
+    setPipelineStatus("Running agents…", "running");
+  } else {
+    setNodeState("human_approval", "done");
+    setNodeState("final_agent", "active");
+    setPipelineStatus("Writing final plan…", "running");
+  }
+}
+
+function pipelineFromResult(data) {
+  if (data.guardrail_allowed === false) {
+    setNodeState("guardrail", "blocked");
+    ["supervisor", ...SPECIALISTS, "human_approval", "final_agent"].forEach((n) =>
+      setNodeState(n, "skipped")
+    );
+    setPipelineStatus("Blocked by guardrail", "blocked");
+    return;
+  }
+
+  const selected = new Set(data.selected_agents || []);
+  // The itinerary agent always runs before human review.
+  selected.add("itinerary_agent");
+
+  setNodeState("guardrail", "done");
+  setNodeState("supervisor", "done");
+  SPECIALISTS.forEach((n) => setNodeState(n, selected.has(n) ? "done" : "skipped"));
+
+  if (data.requires_approval) {
+    setNodeState("human_approval", "waiting");
+    setNodeState("final_agent", null);
+    setPipelineStatus("Awaiting your review", "waiting");
+  } else {
+    setNodeState("human_approval", "done");
+    setNodeState("final_agent", "done");
+    setPipelineStatus("Completed", "done");
+  }
+}
+
+function pipelineReset() {
+  ["guardrail", "supervisor", ...SPECIALISTS, "human_approval", "final_agent"].forEach((n) =>
+    setNodeState(n, null)
+  );
+  setPipelineStatus("Idle", "");
+}
+
+// ---------- Workflow summary ----------
+
+function showWorkflow(data, elapsedMs) {
   const section = document.getElementById("workflowSection");
   const reasoning = document.getElementById("supervisorReasoning");
   const chips = document.getElementById("agentChips");
   const guardrailBadge = document.getElementById("guardrailBadge");
 
-  reasoning.textContent = data.supervisor_reasoning || "Supervisor routing completed.";
+  reasoning.textContent =
+    data.supervisor_reasoning || data.guardrail_reason || "Supervisor routing completed.";
   chips.innerHTML = "";
 
-  (data.selected_agents || []).forEach((agent) => {
+  const agents = data.selected_agents || [];
+  agents.forEach((agent) => {
     const chip = document.createElement("span");
     chip.className = "agent-chip";
     chip.textContent = AGENT_LABELS[agent] || agent;
     chips.appendChild(chip);
   });
+
+  document.getElementById("statAgents").textContent = agents.length;
+  document.getElementById("statLlm").textContent = data.llm_calls || 0;
+  if (typeof elapsedMs === "number") {
+    document.getElementById("statTime").textContent = `${(elapsedMs / 1000).toFixed(1)}s`;
+  }
 
   if (data.guardrail_allowed === false) {
     guardrailBadge.textContent = "Guardrail blocked";
@@ -82,17 +175,60 @@ function showWorkflow(data) {
   section.classList.remove("hidden");
 }
 
-function showResult(answer, threadId, isDraft = false) {
-  latestAnswerMarkdown = answer || "";
+// ---------- Result + tabs ----------
+
+function tabContent(key) {
+  if (!latestData) {
+    return "";
+  }
+  if (key === "plan") {
+    return latestData.__plan || "";
+  }
+  return latestData[key] || "";
+}
+
+function selectTab(key) {
+  document.querySelectorAll("#resultTabs .tab").forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.key === key);
+  });
+  latestAnswerMarkdown = tabContent(key);
+  renderMarkdown(document.getElementById("resultBox"), latestAnswerMarkdown);
+}
+
+function renderTabs() {
+  const tabs = document.getElementById("resultTabs");
+  tabs.innerHTML = "";
+
+  const available = RESULT_TABS.filter((t) => t.key === "plan" || tabContent(t.key).trim());
+  if (available.length < 2) {
+    return;
+  }
+
+  available.forEach((t) => {
+    const btn = document.createElement("button");
+    btn.className = "tab";
+    btn.type = "button";
+    btn.dataset.key = t.key;
+    btn.textContent = t.label;
+    btn.onclick = () => selectTab(t.key);
+    tabs.appendChild(btn);
+  });
+}
+
+function showResult(data, answer, isDraft = false) {
+  latestData = { ...data, __plan: answer || "" };
 
   const resultSection = document.getElementById("resultSection");
-  const resultBox = document.getElementById("resultBox");
   const threadInfo = document.getElementById("threadInfo");
   const resultTitle = document.getElementById("resultTitle");
+  const resultEyebrow = document.getElementById("resultEyebrow");
 
-  renderMarkdown(resultBox, latestAnswerMarkdown);
-  threadInfo.textContent = `Thread ID: ${threadId}`;
-  resultTitle.textContent = isDraft ? "Draft Travel Plan" : "Your Final AI Travel Plan";
+  threadInfo.textContent = `Thread ID: ${data.thread_id}`;
+  resultTitle.textContent = isDraft ? "Draft travel plan" : "Your final travel plan";
+  resultEyebrow.textContent = isDraft ? "Step 2 · Draft" : "Step 4 · Final plan";
+
+  renderTabs();
+  selectTab("plan");
   resultSection.classList.remove("hidden");
 
   resultSection.scrollIntoView({
@@ -116,6 +252,8 @@ function hideApproval() {
   document.getElementById("approvalFeedback").value = "";
 }
 
+// ---------- API calls ----------
+
 async function sendMessage() {
   hideError();
 
@@ -133,6 +271,8 @@ async function sendMessage() {
   }
 
   setLoading(true, "draft");
+  pipelineRunning("draft");
+  const startedAt = performance.now();
 
   try {
     const response = await fetch("/api/travel", {
@@ -155,16 +295,18 @@ async function sendMessage() {
     currentThreadId = data.thread_id;
     localStorage.setItem("travel_thread_id", currentThreadId);
 
-    showWorkflow(data);
+    showWorkflow(data, performance.now() - startedAt);
+    pipelineFromResult(data);
 
     if (data.requires_approval) {
-      showResult(data.itinerary || data.answer, data.thread_id, true);
+      showResult(data, data.itinerary || data.answer, true);
       showApproval(data);
     } else {
       hideApproval();
-      showResult(data.answer, data.thread_id, false);
+      showResult(data, data.answer, false);
     }
   } catch (error) {
+    pipelineReset();
     showError(error.message);
   } finally {
     setLoading(false, "draft");
@@ -189,6 +331,8 @@ async function submitApproval(approved) {
   }
 
   setLoading(true, "approval");
+  pipelineRunning("final");
+  const startedAt = performance.now();
 
   try {
     const response = await fetch("/api/travel/approve", {
@@ -209,13 +353,38 @@ async function submitApproval(approved) {
       throw new Error(data.error || "Could not resume the travel workflow.");
     }
 
-    showWorkflow(data);
+    showWorkflow(data, performance.now() - startedAt);
+    pipelineFromResult(data);
     hideApproval();
-    showResult(data.answer, data.thread_id, false);
+    showResult(data, data.answer, false);
   } catch (error) {
+    setNodeState("human_approval", "waiting");
+    setNodeState("final_agent", null);
+    setPipelineStatus("Awaiting your review", "waiting");
     showError(error.message);
   } finally {
     setLoading(false, "approval");
+  }
+}
+
+// ---------- Utilities ----------
+
+async function checkHealth() {
+  const pill = document.getElementById("statusPill");
+  const text = document.getElementById("statusText");
+
+  try {
+    const response = await fetch("/health");
+    if (!response.ok) {
+      throw new Error();
+    }
+    pill.classList.add("online");
+    pill.classList.remove("offline");
+    text.textContent = "API online";
+  } catch {
+    pill.classList.add("offline");
+    pill.classList.remove("online");
+    text.textContent = "API offline";
   }
 }
 
@@ -255,9 +424,12 @@ function downloadPDF() {
   downloadBtn.textContent = "Preparing PDF...";
   downloadBtn.disabled = true;
 
+  const pdfTitle = pdfContent.querySelector(".pdf-title");
+  pdfTitle.style.display = "block";
+
   const options = {
     margin: 0.5,
-    filename: "ai-travel-plan.pdf",
+    filename: "tripmate-travel-plan.pdf",
     image: {
       type: "jpeg",
       quality: 0.98
@@ -277,17 +449,19 @@ function downloadPDF() {
     }
   };
 
+  const restore = () => {
+    pdfTitle.style.display = "";
+    downloadBtn.textContent = oldText;
+    downloadBtn.disabled = false;
+  };
+
   html2pdf()
     .set(options)
     .from(pdfContent)
     .save()
-    .then(() => {
-      downloadBtn.textContent = oldText;
-      downloadBtn.disabled = false;
-    })
+    .then(restore)
     .catch(() => {
-      downloadBtn.textContent = oldText;
-      downloadBtn.disabled = false;
+      restore();
       showError("Could not download PDF.");
     });
 }
@@ -297,3 +471,5 @@ document.addEventListener("keydown", function(event) {
     sendMessage();
   }
 });
+
+checkHealth();
